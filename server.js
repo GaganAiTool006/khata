@@ -47,46 +47,56 @@ const DB_FILE = path.join(__dirname, "hisabkitab.db");
 let db = null;
 
 async function initializeDatabase() {
-  const SQL = await initSqlJs();
-  
-  let data = null;
-  if (fs.existsSync(DB_FILE)) {
-    data = fs.readFileSync(DB_FILE);
+  try {
+    console.log("[v0] Initializing SQL.js database...");
+    const SQL = await initSqlJs();
+    
+    let data = null;
+    if (fs.existsSync(DB_FILE)) {
+      data = fs.readFileSync(DB_FILE);
+      console.log("[v0] Loaded existing database file");
+    } else {
+      console.log("[v0] Creating new database file");
+    }
+    
+    db = new SQL.Database(data);
+    
+    // Create tables agar pehle se exist nahi karte
+    db.run(`
+      CREATE TABLE IF NOT EXISTS users (
+        id       INTEGER PRIMARY KEY AUTOINCREMENT,
+        name     TEXT NOT NULL,
+        email    TEXT NOT NULL UNIQUE,
+        password TEXT NOT NULL,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP
+      );
+
+      CREATE TABLE IF NOT EXISTS customers (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id       INTEGER NOT NULL,
+        customer_name TEXT NOT NULL,
+        phone         TEXT,
+        created_at    TEXT DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+      );
+
+      CREATE TABLE IF NOT EXISTS transactions (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        customer_id INTEGER NOT NULL,
+        amount      REAL NOT NULL,
+        type        TEXT NOT NULL CHECK (type IN ('credit', 'debit')),
+        description TEXT,
+        created_at  TEXT DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (customer_id) REFERENCES customers(id) ON DELETE CASCADE
+      );
+    `);
+    
+    saveDatabase();
+    console.log("[v0] Database initialized successfully");
+  } catch (error) {
+    console.error("[v0] Database initialization error:", error);
+    throw error;
   }
-  
-  db = new SQL.Database(data);
-  
-  // Create tables agar pehle se exist nahi karte
-  db.run(`
-    CREATE TABLE IF NOT EXISTS users (
-      id       INTEGER PRIMARY KEY AUTOINCREMENT,
-      name     TEXT NOT NULL,
-      email    TEXT NOT NULL UNIQUE,
-      password TEXT NOT NULL,
-      created_at TEXT DEFAULT CURRENT_TIMESTAMP
-    );
-
-    CREATE TABLE IF NOT EXISTS customers (
-      id            INTEGER PRIMARY KEY AUTOINCREMENT,
-      user_id       INTEGER NOT NULL,
-      customer_name TEXT NOT NULL,
-      phone         TEXT,
-      created_at    TEXT DEFAULT CURRENT_TIMESTAMP,
-      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-    );
-
-    CREATE TABLE IF NOT EXISTS transactions (
-      id          INTEGER PRIMARY KEY AUTOINCREMENT,
-      customer_id INTEGER NOT NULL,
-      amount      REAL NOT NULL,
-      type        TEXT NOT NULL CHECK (type IN ('credit', 'debit')),
-      description TEXT,
-      created_at  TEXT DEFAULT CURRENT_TIMESTAMP,
-      FOREIGN KEY (customer_id) REFERENCES customers(id) ON DELETE CASCADE
-    );
-  `);
-  
-  saveDatabase();
 }
 
 function saveDatabase() {
@@ -439,8 +449,33 @@ app.get(/^(?!\/api\/).*/, (req, res) => {
 // START SERVER
 // ---------------------------------------------------------------------------
 (async () => {
-  await initializeDatabase();
-  app.listen(PORT, () => {
-    console.log(`✅ Hisab Kitab server running at http://localhost:${PORT}`);
-  });
+  try {
+    await initializeDatabase();
+    
+    // Try to start server with port conflict handling
+    let actualPort = PORT;
+    let server;
+    
+    const tryStartServer = (port) => {
+      return new Promise((resolve, reject) => {
+        const srv = app.listen(port, () => {
+          console.log(`✅ Hisab Kitab server running at http://localhost:${port}`);
+          resolve(srv);
+        }).on('error', (err) => {
+          if (err.code === 'EADDRINUSE') {
+            console.warn(`[v0] Port ${port} is already in use, trying port ${port + 1}...`);
+            tryStartServer(port + 1).then(resolve).catch(reject);
+          } else {
+            reject(err);
+          }
+        });
+      });
+    };
+
+    server = await tryStartServer(actualPort);
+
+  } catch (error) {
+    console.error("[v0] Failed to start server:", error.message);
+    process.exit(1);
+  }
 })();
