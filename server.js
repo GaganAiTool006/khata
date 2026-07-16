@@ -23,7 +23,8 @@ require("dotenv").config();
 const express = require("express");
 const path = require("path");
 const cors = require("cors");
-const Database = require("better-sqlite3");
+const fs = require("fs");
+const initSqlJs = require("sql.js");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 
@@ -40,40 +41,60 @@ app.use(express.json());                            // parse JSON request bodies
 app.use(express.static(path.join(__dirname, "public"))); // serve index.html + app.js
 
 // ---------------------------------------------------------------------------
-// DATABASE SETUP (SQLite via better-sqlite3 — synchronous, simple, beginner friendly)
+// DATABASE SETUP (SQLite via sql.js — works in Node.js without native compilation)
 // ---------------------------------------------------------------------------
-const db = new Database(path.join(__dirname, "hisabkitab.db"));
-db.pragma("foreign_keys = ON"); // taaki customer_id / user_id references sahi se enforce ho
+const DB_FILE = path.join(__dirname, "hisabkitab.db");
+let db = null;
 
-// Create tables agar pehle se exist nahi karte (app pehli baar chalane par)
-db.exec(`
-  CREATE TABLE IF NOT EXISTS users (
-    id       INTEGER PRIMARY KEY AUTOINCREMENT,
-    name     TEXT NOT NULL,
-    email    TEXT NOT NULL UNIQUE,
-    password TEXT NOT NULL,          -- bcrypt hashed password, kabhi bhi plain text store nahi karte
-    created_at TEXT DEFAULT CURRENT_TIMESTAMP
-  );
+async function initializeDatabase() {
+  const SQL = await initSqlJs();
+  
+  let data = null;
+  if (fs.existsSync(DB_FILE)) {
+    data = fs.readFileSync(DB_FILE);
+  }
+  
+  db = new SQL.Database(data);
+  
+  // Create tables agar pehle se exist nahi karte
+  db.run(`
+    CREATE TABLE IF NOT EXISTS users (
+      id       INTEGER PRIMARY KEY AUTOINCREMENT,
+      name     TEXT NOT NULL,
+      email    TEXT NOT NULL UNIQUE,
+      password TEXT NOT NULL,
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    );
 
-  CREATE TABLE IF NOT EXISTS customers (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id       INTEGER NOT NULL,
-    customer_name TEXT NOT NULL,
-    phone         TEXT,
-    created_at    TEXT DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-  );
+    CREATE TABLE IF NOT EXISTS customers (
+      id            INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id       INTEGER NOT NULL,
+      customer_name TEXT NOT NULL,
+      phone         TEXT,
+      created_at    TEXT DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    );
 
-  CREATE TABLE IF NOT EXISTS transactions (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    customer_id INTEGER NOT NULL,
-    amount      REAL NOT NULL,
-    type        TEXT NOT NULL CHECK (type IN ('credit', 'debit')),
-    description TEXT,
-    created_at  TEXT DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (customer_id) REFERENCES customers(id) ON DELETE CASCADE
-  );
-`);
+    CREATE TABLE IF NOT EXISTS transactions (
+      id          INTEGER PRIMARY KEY AUTOINCREMENT,
+      customer_id INTEGER NOT NULL,
+      amount      REAL NOT NULL,
+      type        TEXT NOT NULL CHECK (type IN ('credit', 'debit')),
+      description TEXT,
+      created_at  TEXT DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (customer_id) REFERENCES customers(id) ON DELETE CASCADE
+    );
+  `);
+  
+  saveDatabase();
+}
+
+function saveDatabase() {
+  if (db) {
+    const data = db.export();
+    fs.writeFileSync(DB_FILE, Buffer.from(data));
+  }
+}
 
 // ---------------------------------------------------------------------------
 // AUTH MIDDLEWARE — checks the "Authorization: Bearer <token>" header
@@ -98,9 +119,48 @@ function authenticateToken(req, res, next) {
 // Helper: ensure the logged-in user actually owns this customer before
 // letting them read/write its transactions.
 function getOwnedCustomerOrNull(customerId, userId) {
-  return db
-    .prepare("SELECT * FROM customers WHERE id = ? AND user_id = ?")
-    .get(customerId, userId);
+  try {
+    const stmt = db.prepare("SELECT * FROM customers WHERE id = ? AND user_id = ?");
+    stmt.bind([customerId, userId]);
+    const hasRow = stmt.step();
+    const result = hasRow ? stmt.getAsObject() : null;
+    stmt.free();
+    return result;
+  } catch (err) {
+    return null;
+  }
+}
+
+// Helper: execute query and get all results
+function queryAll(sql, params = []) {
+  const stmt = db.prepare(sql);
+  if (params.length) stmt.bind(params);
+  const results = [];
+  while (stmt.step()) {
+    results.push(stmt.getAsObject());
+  }
+  stmt.free();
+  return results;
+}
+
+// Helper: execute query and get one result
+function queryOne(sql, params = []) {
+  const stmt = db.prepare(sql);
+  if (params.length) stmt.bind(params);
+  const hasRow = stmt.step();
+  const result = hasRow ? stmt.getAsObject() : null;
+  stmt.free();
+  return result;
+}
+
+// Helper: execute insert/update/delete
+function execute(sql, params = []) {
+  const stmt = db.prepare(sql);
+  if (params.length) stmt.bind(params);
+  stmt.step();
+  stmt.free();
+  saveDatabase();
+  return { changes: db.getRowsModified() };
 }
 
 // ============================================================================
@@ -119,7 +179,7 @@ app.post("/api/auth/signup", (req, res) => {
       return res.status(400).json({ error: "Password must be at least 6 characters." });
     }
 
-    const existing = db.prepare("SELECT id FROM users WHERE email = ?").get(email.toLowerCase());
+    const existing = queryOne("SELECT id FROM users WHERE email = ?", [email.toLowerCase()]);
     if (existing) {
       return res.status(409).json({ error: "An account with this email already exists." });
     }
@@ -127,11 +187,14 @@ app.post("/api/auth/signup", (req, res) => {
     // Password ko hash karke store karte hain — kabhi plain text nahi
     const hashedPassword = bcrypt.hashSync(password, 10);
 
-    const result = db
-      .prepare("INSERT INTO users (name, email, password) VALUES (?, ?, ?)")
-      .run(name.trim(), email.toLowerCase().trim(), hashedPassword);
+    execute(
+      "INSERT INTO users (name, email, password) VALUES (?, ?, ?)",
+      [name.trim(), email.toLowerCase().trim(), hashedPassword]
+    );
 
-    const user = { id: result.lastInsertRowid, name: name.trim(), email: email.toLowerCase().trim() };
+    // Get the inserted user
+    const row = queryOne("SELECT id, name, email FROM users WHERE email = ?", [email.toLowerCase().trim()]);
+    const user = row;
     const token = jwt.sign(user, JWT_SECRET, { expiresIn: JWT_EXPIRES_IN });
 
     res.status(201).json({ message: "Account created successfully.", token, user });
@@ -149,7 +212,7 @@ app.post("/api/auth/login", (req, res) => {
       return res.status(400).json({ error: "Email and password are required." });
     }
 
-    const row = db.prepare("SELECT * FROM users WHERE email = ?").get(email.toLowerCase().trim());
+    const row = queryOne("SELECT * FROM users WHERE email = ?", [email.toLowerCase().trim()]);
     if (!row) {
       return res.status(401).json({ error: "Invalid email or password." });
     }
@@ -182,19 +245,18 @@ app.get("/api/auth/me", authenticateToken, (req, res) => {
 // GET /api/customers — logged-in user ke saare customers, unke current balance ke saath
 app.get("/api/customers", authenticateToken, (req, res) => {
   try {
-    const customers = db
-      .prepare(
-        `SELECT
-           c.id, c.customer_name, c.phone, c.created_at,
-           COALESCE(SUM(CASE WHEN t.type = 'credit' THEN t.amount ELSE 0 END), 0) -
-           COALESCE(SUM(CASE WHEN t.type = 'debit'  THEN t.amount ELSE 0 END), 0) AS balance
-         FROM customers c
-         LEFT JOIN transactions t ON t.customer_id = c.id
-         WHERE c.user_id = ?
-         GROUP BY c.id
-         ORDER BY c.created_at DESC`
-      )
-      .all(req.user.id);
+    const customers = queryAll(
+      `SELECT
+         c.id, c.customer_name, c.phone, c.created_at,
+         COALESCE(SUM(CASE WHEN t.type = 'credit' THEN t.amount ELSE 0 END), 0) -
+         COALESCE(SUM(CASE WHEN t.type = 'debit'  THEN t.amount ELSE 0 END), 0) AS balance
+       FROM customers c
+       LEFT JOIN transactions t ON t.customer_id = c.id
+       WHERE c.user_id = ?
+       GROUP BY c.id
+       ORDER BY c.created_at DESC`,
+      [req.user.id]
+    );
 
     res.json({ customers });
   } catch (err) {
@@ -211,11 +273,13 @@ app.post("/api/customers", authenticateToken, (req, res) => {
       return res.status(400).json({ error: "Customer name is required." });
     }
 
-    const result = db
-      .prepare("INSERT INTO customers (user_id, customer_name, phone) VALUES (?, ?, ?)")
-      .run(req.user.id, customer_name.trim(), phone ? phone.trim() : null);
+    execute(
+      "INSERT INTO customers (user_id, customer_name, phone) VALUES (?, ?, ?)",
+      [req.user.id, customer_name.trim(), phone ? phone.trim() : null]
+    );
 
-    const customer = db.prepare("SELECT * FROM customers WHERE id = ?").get(result.lastInsertRowid);
+    const customers = queryAll("SELECT * FROM customers WHERE user_id = ? ORDER BY id DESC LIMIT 1", [req.user.id]);
+    const customer = customers[0];
     res.status(201).json({ message: "Customer added.", customer: { ...customer, balance: 0 } });
   } catch (err) {
     console.error(err);
@@ -231,7 +295,7 @@ app.delete("/api/customers/:id", authenticateToken, (req, res) => {
       return res.status(404).json({ error: "Customer not found." });
     }
 
-    db.prepare("DELETE FROM customers WHERE id = ?").run(customer.id); // ON DELETE CASCADE -> transactions bhi hat jaayenge
+    execute("DELETE FROM customers WHERE id = ?", [customer.id]);
     res.json({ message: "Customer deleted." });
   } catch (err) {
     console.error(err);
@@ -251,9 +315,10 @@ app.get("/api/customers/:customerId/transactions", authenticateToken, (req, res)
       return res.status(404).json({ error: "Customer not found." });
     }
 
-    const transactions = db
-      .prepare("SELECT * FROM transactions WHERE customer_id = ? ORDER BY created_at DESC, id DESC")
-      .all(customer.id);
+    const transactions = queryAll(
+      "SELECT * FROM transactions WHERE customer_id = ? ORDER BY created_at DESC, id DESC",
+      [customer.id]
+    );
 
     // Running balance bhi calculate karke bhej dete hain, taaki frontend ko dobara add/subtract na karna pade
     const balance = transactions.reduce(
@@ -286,13 +351,16 @@ app.post("/api/customers/:customerId/transactions", authenticateToken, (req, res
       return res.status(400).json({ error: "Type must be either 'credit' or 'debit'." });
     }
 
-    const result = db
-      .prepare(
-        "INSERT INTO transactions (customer_id, amount, type, description) VALUES (?, ?, ?, ?)"
-      )
-      .run(customer.id, numericAmount, type, description ? description.trim() : null);
+    execute(
+      "INSERT INTO transactions (customer_id, amount, type, description) VALUES (?, ?, ?, ?)",
+      [customer.id, numericAmount, type, description ? description.trim() : null]
+    );
 
-    const transaction = db.prepare("SELECT * FROM transactions WHERE id = ?").get(result.lastInsertRowid);
+    const transactions = queryAll(
+      "SELECT * FROM transactions WHERE customer_id = ? ORDER BY id DESC LIMIT 1",
+      [customer.id]
+    );
+    const transaction = transactions[0];
     res.status(201).json({ message: "Transaction saved.", transaction });
   } catch (err) {
     console.error(err);
@@ -303,7 +371,7 @@ app.post("/api/customers/:customerId/transactions", authenticateToken, (req, res
 // DELETE /api/transactions/:id — ek galat entry delete karne ke liye
 app.delete("/api/transactions/:id", authenticateToken, (req, res) => {
   try {
-    const transaction = db.prepare("SELECT * FROM transactions WHERE id = ?").get(req.params.id);
+    const transaction = queryOne("SELECT * FROM transactions WHERE id = ?", [req.params.id]);
     if (!transaction) {
       return res.status(404).json({ error: "Transaction not found." });
     }
@@ -313,7 +381,7 @@ app.delete("/api/transactions/:id", authenticateToken, (req, res) => {
       return res.status(403).json({ error: "You do not have permission to delete this transaction." });
     }
 
-    db.prepare("DELETE FROM transactions WHERE id = ?").run(transaction.id);
+    execute("DELETE FROM transactions WHERE id = ?", [transaction.id]);
     res.json({ message: "Transaction deleted." });
   } catch (err) {
     console.error(err);
@@ -326,17 +394,16 @@ app.delete("/api/transactions/:id", authenticateToken, (req, res) => {
 // ============================================================================
 app.get("/api/dashboard/summary", authenticateToken, (req, res) => {
   try {
-    const rows = db
-      .prepare(
-        `SELECT
-           COALESCE(SUM(CASE WHEN t.type = 'credit' THEN t.amount ELSE 0 END), 0) -
-           COALESCE(SUM(CASE WHEN t.type = 'debit'  THEN t.amount ELSE 0 END), 0) AS balance
-         FROM customers c
-         LEFT JOIN transactions t ON t.customer_id = c.id
-         WHERE c.user_id = ?
-         GROUP BY c.id`
-      )
-      .all(req.user.id);
+    const rows = queryAll(
+      `SELECT
+         COALESCE(SUM(CASE WHEN t.type = 'credit' THEN t.amount ELSE 0 END), 0) -
+         COALESCE(SUM(CASE WHEN t.type = 'debit'  THEN t.amount ELSE 0 END), 0) AS balance
+       FROM customers c
+       LEFT JOIN transactions t ON t.customer_id = c.id
+       WHERE c.user_id = ?
+       GROUP BY c.id`,
+      [req.user.id]
+    );
 
     let toReceive = 0; // total jo customers par baaki hai (balance > 0)
     let toGive = 0;    // total jo aapko customers ko wapas dena hai (balance < 0)
@@ -346,9 +413,8 @@ app.get("/api/dashboard/summary", authenticateToken, (req, res) => {
       else toGive += Math.abs(r.balance);
     });
 
-    const customerCount = db
-      .prepare("SELECT COUNT(*) AS count FROM customers WHERE user_id = ?")
-      .get(req.user.id).count;
+    const countResult = queryOne("SELECT COUNT(*) AS count FROM customers WHERE user_id = ?", [req.user.id]);
+    const customerCount = countResult ? countResult.count : 0;
 
     res.json({
       toReceive,
@@ -372,6 +438,9 @@ app.get(/^(?!\/api\/).*/, (req, res) => {
 // ---------------------------------------------------------------------------
 // START SERVER
 // ---------------------------------------------------------------------------
-app.listen(PORT, () => {
-  console.log(`✅ Hisab Kitab server running at http://localhost:${PORT}`);
-});
+(async () => {
+  await initializeDatabase();
+  app.listen(PORT, () => {
+    console.log(`✅ Hisab Kitab server running at http://localhost:${PORT}`);
+  });
+})();
